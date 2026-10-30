@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# Model ağırlıkları ve Primus çıktıları büyük: depoya koyulmaz
+*.pt
+*.pt.tmp
+*.safetensors
+ozellikler/

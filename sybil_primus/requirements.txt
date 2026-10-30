@@ -1,0 +1,11 @@
+# PyTorch 2.x'i CUDA sürümünüze uygun şekilde ayrıca kurun (https://pytorch.org)
+dynamic-network-architectures==0.4.3
+safetensors
+transformers==5.6.2
+colipri
+torchio
+pandas
+numpy
+scikit-learn
+lifelines
+matplotlib
