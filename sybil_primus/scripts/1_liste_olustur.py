@@ -4,13 +4,23 @@ ADIM 1 — Seri listesi, Sybil etiketleri ve hasta bazında bölünme.
 GİRDİ
   --seri-listeleri  bir ya da birkaç CSV. Gerekli sütunlar:
                       patient_id, SeriesInstanceUID, screen_timepoint (T0/T1/T2 ya da 0/1/2), dicom_dir
-                    İsteğe bağlı: split (train/dev/test). Varsa aynen kullanılır (ör. Sybil'in NLST bölünmesi).
+                    İsteğe bağlı:
+                      split           train/dev/test. Varsa aynen kullanılır (ör. Sybil'in NLST bölünmesi);
+                                      bütün satırlarda dolu olmalı.
+                      slice_thickness kesit kalınlığı (mm). Yoksa serinin ilk DICOM dosyasının başlığından okunur.
+                      instanceCount   kesit sayısı. Yoksa klasördeki dosyalar sayılır.
   --klinik          NLST nlst_prsn tablosu (pid, scr_days0..2, candx_days, fup_days ya da canc_free_days)
 
 NE YAPAR
-  1. Her seri için Sybil'in etiket kuralıyla (orijinal Sybil'deki sybil/datasets/nlst.py get_label) y, y_seq, y_mask, time_at_event.
-     Etiketi hesaplanamayan seriler (eksik gün bilgisi, tanı taramadan önce) çıkarılır.
-  2. split sütunu yoksa hastaları eğitim / doğrulama / test diye böler (varsayılan %70 / %15 / %15).
+  1. Seri seçimi (orijinal Sybil'deki gibi: --use_only_thin_cuts_for_ct, --slice_thickness_filter 2.5):
+     NLST'de aynı tarama birkaç seri olarak kayıtlıdır (farklı filtre / kalınlık, yön bulma görüntüleri).
+     - kesit sayısı --en-az-kesit'ten az olanlar (yön bulma / localizer) ve kalınlığı --en-fazla-kalinlik'tan
+       büyük olanlar elenir,
+     - her taramadan (kişi + tarama yılı) en ince kesitli TEK seri kalır (eşitlikte kesit sayısı çok olan).
+     --tum-seriler ile bu adım atlanır.
+  2. Her seri için Sybil'in etiket kuralıyla (orijinal Sybil'deki sybil/datasets/nlst.py get_label) y, y_seq, y_mask,
+     time_at_event. Etiketi hesaplanamayan seriler (eksik gün bilgisi, tanı taramadan önce) çıkarılır.
+  3. split sütunu yoksa hastaları eğitim / doğrulama / test diye böler (varsayılan %70 / %15 / %15).
      Aynı kişinin bütün serileri aynı bölümde kalır; kanserli ve kansersiz kişiler her bölüme orantılı dağıtılır.
 
 ÇIKTI
@@ -20,6 +30,8 @@ NE YAPAR
     uv run python sybil_primus/scripts/1_liste_olustur.py --seri-listeleri veri/vaka_listesi_idc.csv veri/kontrol_listesi.csv --klinik veri/klinik/nlst_prsn.csv
 """
 import argparse
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +40,7 @@ import pandas as pd
 from ortak import sybil_etiketi
 
 GEREKLI = ["patient_id", "SeriesInstanceUID", "screen_timepoint", "dicom_dir"]
+ISTEGE_BAGLI = ["split", "slice_thickness", "instanceCount"]
 
 
 def oku(dosyalar):
@@ -38,10 +51,56 @@ def oku(dosyalar):
         if eksik:
             raise SystemExit(f"{dosya}: eksik sütun {eksik}")
         t = t[t["dicom_dir"].fillna("") != ""]
-        parcalar.append(t[GEREKLI + (["split"] if "split" in t.columns else [])])
-    seriler = pd.concat(parcalar, ignore_index=True).drop_duplicates("SeriesInstanceUID")
+        parcalar.append(t[GEREKLI + [s for s in ISTEGE_BAGLI if s in t.columns]])
+    seriler = pd.concat(parcalar, ignore_index=True).drop_duplicates("SeriesInstanceUID").reset_index(drop=True)
     seriler["tarama"] = seriler["screen_timepoint"].astype(str).str.lstrip("T").astype(int)
     return seriler
+
+
+def dicom_bilgisi(klasor):
+    """(kesit kalınlığı mm, kesit sayısı). Okunamazsa (nan, dosya sayısı)."""
+    try:
+        dosyalar = [e.path for e in os.scandir(klasor) if e.is_file()]
+    except OSError:
+        return np.nan, 0
+    kalinlik = np.nan
+    if dosyalar:
+        try:
+            import pydicom
+            baslik = pydicom.dcmread(dosyalar[0], stop_before_pixels=True, force=True)
+            kalinlik = float(baslik.get("SliceThickness", np.nan))
+        except Exception:
+            pass
+    return kalinlik, len(dosyalar)
+
+
+def seri_sec(seriler, en_fazla_kalinlik, en_az_kesit, isci):
+    """Orijinal Sybil'deki ince kesit seçimi: her taramadan en ince kesitli tek seri."""
+    eksik_kalinlik = "slice_thickness" not in seriler.columns
+    eksik_sayi = "instanceCount" not in seriler.columns
+    if eksik_kalinlik or eksik_sayi:
+        print(f"Kesit kalınlığı / sayısı DICOM başlıklarından okunuyor ({len(seriler)} seri)...", flush=True)
+        with ThreadPoolExecutor(isci) as havuz:
+            bilgi = list(havuz.map(dicom_bilgisi, seriler["dicom_dir"].astype(str)))
+        if eksik_kalinlik:
+            seriler["slice_thickness"] = [b[0] for b in bilgi]
+        if eksik_sayi:
+            seriler["instanceCount"] = [b[1] for b in bilgi]
+    kalinlik = pd.to_numeric(seriler["slice_thickness"], errors="coerce")
+    sayi = pd.to_numeric(seriler["instanceCount"], errors="coerce").fillna(0)
+
+    bilinmeyen = int(kalinlik.isna().sum())
+    if bilinmeyen:
+        print(f"UYARI: {bilinmeyen} serinin kesit kalınlığı okunamadı; bu seriler elendi")
+    uygun = (sayi >= en_az_kesit) & (kalinlik <= en_fazla_kalinlik)
+    print(f"Elenen: {int((sayi < en_az_kesit).sum())} seri {en_az_kesit}'den az kesitli (yön bulma vb.), "
+          f"{int((kalinlik > en_fazla_kalinlik).sum())} seri {en_fazla_kalinlik} mm'den kalın")
+
+    secim = (seriler[uygun].assign(_k=kalinlik[uygun], _s=-sayi[uygun])
+             .sort_values(["patient_id", "tarama", "_k", "_s", "SeriesInstanceUID"])
+             .drop_duplicates(["patient_id", "tarama"]).drop(columns=["_k", "_s"]))
+    print(f"Seri seçimi: {len(seriler)} seriden {len(secim)} tarama (her taramadan bir seri)")
+    return secim.reset_index(drop=True)
 
 
 def bol(seriler, oranlar, tohum):
@@ -65,9 +124,19 @@ def main():
     ap.add_argument("--cikti", default="sonuclar/sybil_primus/seriler.csv")
     ap.add_argument("--oranlar", nargs=3, type=float, default=[0.70, 0.15, 0.15], metavar=("EGITIM", "DOGRULAMA", "TEST"))
     ap.add_argument("--tohum", type=int, default=0)
+    ap.add_argument("--en-fazla-kalinlik", type=float, default=2.5, help="mm; Sybil'deki --slice_thickness_filter")
+    ap.add_argument("--en-az-kesit", type=int, default=50, help="bundan az kesitli seriler (yön bulma) elenir")
+    ap.add_argument("--tum-seriler", action="store_true", help="seri seçimini atla, listedeki bütün serileri kullan")
+    ap.add_argument("--isci", type=int, default=16, help="DICOM başlığı okumak için paralel iş parçacığı")
     args = ap.parse_args()
 
     seriler = oku(args.seri_listeleri)
+    if "split" in seriler.columns and seriler["split"].isna().any():
+        raise SystemExit(f"split sütunu {int(seriler['split'].isna().sum())} satırda boş. "
+                         "Bütün satırları doldurun ya da sütunu kaldırın (o zaman script kendisi böler).")
+    if not args.tum_seriler:
+        seriler = seri_sec(seriler, args.en_fazla_kalinlik, args.en_az_kesit, args.isci)
+
     prsn = pd.read_csv(args.klinik, low_memory=False)
     prsn["hasta"] = prsn["pid" if "pid" in prsn.columns else "dicom_patient_id"].astype(str)
     prsn = prsn.drop_duplicates("hasta").set_index("hasta")
@@ -84,16 +153,17 @@ def main():
     if atilan:
         print(f"UYARI: {atilan} seri etiketi hesaplanamadığı için çıkarıldı")
 
-    if "split" not in seriler.columns or seriler["split"].isna().any():
+    if "split" in seriler.columns:
+        print("Bölünme: girdi dosyasındaki split sütunu kullanıldı")
+    else:
         seriler["split"] = bol(seriler, args.oranlar, args.tohum)
         print(f"Bölünme: hasta bazında, oranlar {args.oranlar}, tohum {args.tohum}")
-    else:
-        print("Bölünme: girdi dosyasındaki split sütunu kullanıldı")
 
     cikti = Path(args.cikti)
     cikti.parent.mkdir(parents=True, exist_ok=True)
     sutunlar = ["patient_id", "SeriesInstanceUID", "screen_timepoint", "dicom_dir", "split",
                 "y", "years_to_cancer", "time_at_event", "y_seq", "y_mask"]
+    sutunlar += [s for s in ("slice_thickness", "instanceCount") if s in seriler.columns]
     seriler[sutunlar].to_csv(cikti, index=False)
 
     ozet = seriler.groupby("split").agg(seri=("y", "size"), kisi=("patient_id", "nunique"),

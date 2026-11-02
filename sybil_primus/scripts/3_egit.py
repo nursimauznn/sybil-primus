@@ -4,13 +4,16 @@ ADIM 3 — Eğitim: adaptör (864->512) + Sybil havuzlama ve risk katmanları, k
   - Eğitim bölümü (split=train) ile eğitir, her epoch sonunda doğrulama bölümünde (split=dev) ölçer:
       kayıp, C-index ve 1–6. yıl AUC (Sybil'in kendi metrik kodu, sybil/utils/metrics.py).
   - En iyi doğrulama C-index'li epoch'u en_iyi.pt olarak saklar (C-index hesaplanamıyorsa doğrulama kaybı).
-  - Erken durdurma: --sabir epoch boyunca iyileşme yoksa durur. Test bölümüne bu adımda hiç bakılmaz.
-  - Kayıp: Sybil'in sağkalım kaybı (get_survival_loss). Nodül dikkat kaybı henüz yok (bkz. README).
+  - Orijinal Sybil'in eğitim tarifine göre: Adam + ağırlık azaltma 1e-2; doğrulama --lr-sabir epoch iyileşmezse
+    lr 10'a bölünür. Erken durdurma: --sabir epoch boyunca iyileşme yoksa durur. Test bölümüne bu adımda bakılmaz.
+  - Kayıp: Sybil'in sağkalım kaybı (get_survival_loss). --dikkat-kaybi ile Sybil'in nodül dikkat kaybı
+    (get_annotation_loss; kutular 2b_kutu_cikar.py'den) eklenir; kutusu olmayan seriler bu kayıpta atlanır.
+    Sybil'in "kanser hangi akciğerde" kısmı kapalı (o bilgi listede yok). Varsayılan: kapalı.
 
 ÇIKTI  <cikti>/<omurga>/
   en_iyi.pt      eğitilen ağırlıklar + ayarlar + sansür dağılımı (4_degerlendir.py bunu okur)
   son.pt         son epoch (kaldığı yerden devam için değil, karşılaştırma için)
-  gunluk.csv     her epoch: eğitim kaybı, doğrulama kaybı, C-index, AUC'ler
+  gunluk.csv     her epoch: lr, eğitim kaybı, doğrulama kaybı, C-index, AUC'ler
   egriler.png    kayıp ve C-index eğrileri
 
 Örnek (primus-analiz klasöründen):
@@ -26,8 +29,10 @@ import numpy as np
 import pandas as pd
 import torch
 
+from argparse import Namespace
+
 from ortak import MAX_FOLLOWUP, OzellikVeri, metrikler, model_kur, sansur_dagilimi, tahmin_et
-from sybil.utils.losses import get_survival_loss
+from sybil.utils.losses import get_annotation_loss, get_survival_loss
 
 
 def dogrulama_kaybi(model, yukleyici, cihaz):
@@ -67,12 +72,19 @@ def main():
     ap.add_argument("--cikti", default="sonuclar/sybil_primus/egitim")
     ap.add_argument("--epoch", type=int, default=50)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--agirlik-azaltma", type=float, default=0.0, help="Adam weight_decay")
+    ap.add_argument("--agirlik-azaltma", type=float, default=1e-2, help="Adam weight_decay (orijinal Sybil: 1e-2)")
+    ap.add_argument("--lr-sabir", type=int, default=5,
+                    help="doğrulama C-index'i bu kadar epoch iyileşmezse lr 10'a bölünür "
+                         "(orijinal Sybil: lr_decay 0.1, patience 5)")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.25)
     ap.add_argument("--sabir", type=int, default=10, help="erken durdurma: bu kadar epoch iyileşme yoksa dur")
     ap.add_argument("--isci", type=int, default=4, help="diskten okuma için paralel süreç sayısı")
     ap.add_argument("--tohum", type=int, default=0)
+    ap.add_argument("--dikkat-kaybi", action="store_true",
+                    help="Sybil'in nodül dikkat kaybını ekle (2b_kutu_cikar.py'nin kutuları gerekir)")
+    ap.add_argument("--kutular", default=None, help="varsayılan sonuclar/sybil_primus/kutular/<omurga>")
+    ap.add_argument("--dikkat-agirligi", type=float, default=1.0, help="dikkat kaybının ağırlığı (Sybil: 1)")
     args = ap.parse_args()
 
     torch.manual_seed(args.tohum)
@@ -84,7 +96,16 @@ def main():
 
     liste = pd.read_csv(args.liste, dtype={"patient_id": str})
     klasor = Path(args.ozellikler) / args.omurga
-    egitim = OzellikVeri(liste[liste["split"] == "train"], klasor)
+    kutu_klasor = None
+    if args.dikkat_kaybi:
+        # colipri_ortak_girdi NV küpünü kullandığı için NV'nin kutularını kullanır
+        kutu_klasor = Path(args.kutular or f"sonuclar/sybil_primus/kutular/{'nv' if args.omurga == 'colipri_ortak_girdi' else args.omurga}")
+        if not kutu_klasor.is_dir():
+            raise SystemExit(f"{kutu_klasor} yok; önce 2b_kutu_cikar.py'yi çalıştırın.")
+    # Sybil'in get_annotation_loss ayarları (orijinal Sybil varsayılanları: hepsi 1)
+    dikkat_ayar = Namespace(num_images=24, annotation_loss_lambda=args.dikkat_agirligi,
+                            image_attention_loss_lambda=1.0, volume_attention_loss_lambda=1.0)
+    egitim = OzellikVeri(liste[liste["split"] == "train"], klasor, kutu_klasor)
     dogrulama = OzellikVeri(liste[liste["split"] == "dev"], klasor)
     if len(egitim) == 0 or len(dogrulama) == 0:
         raise SystemExit("Eğitim ya da doğrulama bölümü boş; 1_liste_olustur.py ve 2_ozellik_cikar.py çıktılarını kontrol edin.")
@@ -101,6 +122,7 @@ def main():
     parametreler = [p for p in model.parameters() if p.requires_grad]
     print(f"eğitilen parametre: {sum(p.numel() for p in parametreler) / 1e6:.2f}M")
     optim = torch.optim.Adam(parametreler, lr=args.lr, weight_decay=args.agirlik_azaltma)
+    zamanlayici = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", factor=0.1, patience=args.lr_sabir)
 
     def kaydet(dosya, epoch, olcum):
         torch.save({"model": model.state_dict(), "omurga": args.omurga, "mimari": mimari, "epoch": epoch,
@@ -109,29 +131,43 @@ def main():
     gunluk, en_iyi, en_iyi_epoch, t0 = [], None, 0, time.time()
     for epoch in range(1, args.epoch + 1):
         model.train()
-        toplam, n = 0.0, 0
+        toplam, toplam_dikkat, n = 0.0, 0.0, 0
         for batch in egitim_yuk:
             batch = {k: v.to(cihaz, non_blocking=True) for k, v in batch.items()}
-            kayip, _, _ = get_survival_loss(model(batch["x"]), batch, model, None)
+            cikis = model(batch["x"])
+            kayip, _, _ = get_survival_loss(cikis, batch, model, None)
+            toplam += kayip.item() * len(batch["x"])
+            if args.dikkat_kaybi:
+                dikkat, _, _ = get_annotation_loss(cikis, batch, model, dikkat_ayar)
+                kayip = kayip + dikkat
+                toplam_dikkat += float(dikkat) * len(batch["x"])
             optim.zero_grad()
             kayip.backward()
             optim.step()
-            toplam += kayip.item() * len(batch["x"])
             n += len(batch["x"])
 
         olasilik = tahmin_et(model, dogrulama_yuk, cihaz)
-        olcum = {"epoch": epoch, "egitim_kaybi": toplam / n, "dogrulama_kaybi": dogrulama_kaybi(model, dogrulama_yuk, cihaz),
+        olcum = {"epoch": epoch, "lr": optim.param_groups[0]["lr"], "egitim_kaybi": toplam / n,
+                 **({"dikkat_kaybi": toplam_dikkat / n} if args.dikkat_kaybi else {}),
+                 "dogrulama_kaybi": dogrulama_kaybi(model, dogrulama_yuk, cihaz),
                  **metrikler(olasilik, dogrulama.liste, dagilim)}
         gunluk.append(olcum)
         pd.DataFrame(gunluk).to_csv(cikti / "gunluk.csv", index=False)
 
-        # C-index hesaplanabiliyorsa ona, yoksa doğrulama kaybına göre en iyi epoch
-        puan = olcum["c_index"] if not np.isnan(olcum["c_index"]) else -olcum["dogrulama_kaybi"]
+        # En iyi epoch: doğrulama C-index'i. Hesaplanamadığı epoch'lar (NaN) C-index'li bir epoch'u geçemez;
+        # hiç hesaplanamıyorsa doğrulama kaybı kullanılır. İki ölçek birbiriyle karşılaştırılmaz.
+        c_var = not np.isnan(olcum["c_index"])
+        puan = (c_var, olcum["c_index"] if c_var else -olcum["dogrulama_kaybi"])
+        # lr düşürücü yalnızca C-index'le beslenir; C-index hesaplanamayan epoch'ta adım atılmaz
+        # (kayıpla karışırsa iki farklı ölçek yüzünden lr gereksiz yere düşer)
+        if c_var:
+            zamanlayici.step(olcum["c_index"])
         iyilesti = en_iyi is None or puan > en_iyi
         if iyilesti:
             en_iyi, en_iyi_epoch = puan, epoch
             kaydet(cikti / "en_iyi.pt", epoch, olcum)
-        print(f"epoch {epoch:3d}  eğitim kaybı {olcum['egitim_kaybi']:.4f}  doğrulama kaybı {olcum['dogrulama_kaybi']:.4f}  "
+        dk = f"  dikkat kaybı {olcum['dikkat_kaybi']:.4f}" if args.dikkat_kaybi else ""
+        print(f"epoch {epoch:3d}  lr {olcum['lr']:.0e}  eğitim kaybı {olcum['egitim_kaybi']:.4f}{dk}  doğrulama kaybı {olcum['dogrulama_kaybi']:.4f}  "
               f"C-index {olcum['c_index']:.3f}  AUC1 {olcum['auc_1_yil']:.3f}  AUC6 {olcum['auc_6_yil']:.3f}"
               f"{'  *' if iyilesti else ''}  ({time.time() - t0:.0f} sn)", flush=True)
         if epoch - en_iyi_epoch >= args.sabir:

@@ -57,25 +57,61 @@ def sayi_dizisi(metin):
     return [float(v) for v in str(metin).split()]
 
 
+def isleyici_kur(omurga, nv_klasor, ortak_girdi=False):
+    """Modelin resmi ön işlemesi: DICOM klasörü -> (1, 192, 192, 192). NV: SPL düzeni, COLIPRI: RAS düzeni.
+    2_ozellik_cikar.py ve 2b_kutu_cikar.py aynı işlevi kullanır (kutular görüntüyle aynı dönüşümden geçsin diye)."""
+    if omurga == "nv" or ortak_girdi:
+        from transformers import AutoProcessor
+        yukleyici = AutoProcessor.from_pretrained(str(nv_klasor), trust_remote_code=True).image_processor_3d
+        return lambda d: torch.as_tensor(yukleyici.load_image(str(d), anatomy_region="chest")).float()
+    import torchio as tio
+    from colipri import get_processor
+    isleyici = get_processor()
+    return lambda d: torch.as_tensor(isleyici.process_images(tio.ScalarImage(str(d)))[0].data).float()
+
+
 # ---------------------------------------------------------------------------------------------
 # Veri kümesi: 2_ozellik_cikar.py'nin kaydettiği (864, 24, 24, 24) Primus çıktıları
 # ---------------------------------------------------------------------------------------------
 class OzellikVeri(torch.utils.data.Dataset):
-    def __init__(self, liste, klasor):
+    """kutu_klasor verilirse (2b_kutu_cikar.py çıktısı) Sybil'in dikkat kaybının beklediği alanlar da eklenir;
+    kutusu olmayan serilerde has_annotation=False olur ve kayıp o seriyi atlar."""
+
+    def __init__(self, liste, klasor, kutu_klasor=None):
         self.klasor = Path(klasor)
+        self.kutu_klasor = Path(kutu_klasor) if kutu_klasor else None
         var = liste["SeriesInstanceUID"].map(lambda u: (self.klasor / f"{u}.pt").exists())
         if (~var).any():
             print(f"  UYARI: {int((~var).sum())} serinin Primus çıktısı yok, atlandı ({self.klasor})")
         self.liste = liste[var].reset_index(drop=True)
+        if self.kutu_klasor:
+            kutulu = self.liste["SeriesInstanceUID"].map(lambda u: (self.kutu_klasor / f"{u}.pt").exists())
+            print(f"  nodül kutusu olan seri: {int(kutulu.sum())} / {len(self.liste)} ({self.kutu_klasor})")
 
     def __len__(self):
         return len(self.liste)
 
     def __getitem__(self, i):
         s = self.liste.iloc[i]
-        return {"x": torch.load(self.klasor / f"{s['SeriesInstanceUID']}.pt").float(),
-                "y_seq": torch.tensor(sayi_dizisi(s["y_seq"])), "y_mask": torch.tensor(sayi_dizisi(s["y_mask"])),
-                "y": torch.tensor(int(s["y"])), "time_at_event": torch.tensor(int(s["time_at_event"])), "sira": i}
+        ornek = {"x": torch.load(self.klasor / f"{s['SeriesInstanceUID']}.pt").float(),
+                 "y_seq": torch.tensor(sayi_dizisi(s["y_seq"])), "y_mask": torch.tensor(sayi_dizisi(s["y_mask"])),
+                 "y": torch.tensor(int(s["y"])), "time_at_event": torch.tensor(int(s["time_at_event"])), "sira": i}
+        if self.kutu_klasor:
+            ornek.update(kutu_alanlari(self.kutu_klasor / f"{s['SeriesInstanceUID']}.pt", ornek["x"].shape[1:]))
+        return ornek
+
+
+def kutu_alanlari(dosya, boyut):
+    """Orijinal Sybil'deki nlst.py __getitem__ ile aynı hesap; maske (T, H, W) kesit başına normalize edilir.
+    cancer_laterality sıfır: Sybil'in 'kanser hangi akciğerde' kaybı için bilgi yok, o kısım kapalı kalır."""
+    maske = torch.load(dosya).float() if Path(dosya).exists() else torch.zeros(boyut)
+    alan = maske.sum(dim=(-1, -2))
+    payda = alan.clone()
+    payda[payda == 0] = 1
+    return {"image_annotations": maske / payda[:, None, None],
+            "annotation_areas": alan / (maske.shape[-2] * maske.shape[-1]),
+            "has_annotation": torch.tensor(bool(alan.sum() > 0)),
+            "cancer_laterality": torch.zeros(3, dtype=torch.long)}
 
 
 def model_kur(omurga, dropout=0.25):

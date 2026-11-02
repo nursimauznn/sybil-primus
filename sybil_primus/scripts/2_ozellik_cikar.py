@@ -30,7 +30,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from ortak import OMURGALAR  # noqa: F401  (sybil paketini de hazırlar)
+from ortak import isleyici_kur
 from sybil.models.primus_encoder import FrozenPrimusEncoder
 
 
@@ -41,17 +41,6 @@ class GirdiVeri(torch.utils.data.Dataset):
         self.liste, self.omurga, self.nv_klasor, self.ortak_girdi = liste, omurga, nv_klasor, ortak_girdi
         self.isleyici = None                  # her işçi süreçte ilk kullanımda kurulur
 
-    def _kur(self):
-        if self.omurga == "nv" or self.ortak_girdi:
-            from transformers import AutoProcessor
-            yukleyici = AutoProcessor.from_pretrained(str(self.nv_klasor), trust_remote_code=True).image_processor_3d
-            self.isleyici = lambda d: yukleyici.load_image(d, anatomy_region="chest")
-        else:
-            import torchio as tio
-            from colipri import get_processor
-            isleyici = get_processor()
-            self.isleyici = lambda d: isleyici.process_images(tio.ScalarImage(d))[0].data
-
     def __len__(self):
         return len(self.liste)
 
@@ -59,8 +48,8 @@ class GirdiVeri(torch.utils.data.Dataset):
         s = self.liste.iloc[i]
         try:
             if self.isleyici is None:
-                self._kur()
-            x = torch.as_tensor(self.isleyici(str(s["dicom_dir"]))).float()
+                self.isleyici = isleyici_kur(self.omurga, self.nv_klasor, self.ortak_girdi)
+            x = self.isleyici(s["dicom_dir"])
             if tuple(x.shape) != (1, 192, 192, 192):
                 raise ValueError(f"beklenmeyen küp boyutu {tuple(x.shape)}")
             return {"uid": s["SeriesInstanceUID"], "x": x, "hata": ""}
