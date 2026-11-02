@@ -114,6 +114,48 @@ def kutu_alanlari(dosya, boyut):
             "cancer_laterality": torch.zeros(3, dtype=torch.long)}
 
 
+SYBIL_1 = "28a7cd44f5bcd3e6cc760b65c7e0d54d.ckpt"     # orijinal Sybil topluluğunun 1. modeli (sybil/model.py: sybil_1)
+SYBIL_ADRES = "https://github.com/reginabarzilaygroup/Sybil/releases/download/v1.5.0/sybil_checkpoints.zip"
+SYBIL_KATMANLAR = ("pool.", "prob_of_failure_layer.")   # tasarımın 4. bölgesi: havuzlama + kümülatif risk
+
+
+def sybil_agirlik_yolu(deger):
+    """'varsayilan': ~/.sybil/<sybil_1>.ckpt (orijinal Sybil paketinin kullandığı yer); yoksa Sybil'in kendi adresinden
+    indirilir (~750 MB zip, bir kez). 'yok': None (katmanlar sıfırdan). Başka bir değer: dosya yolu."""
+    if deger == "yok":
+        return None
+    if deger != "varsayilan":
+        if not Path(deger).is_file():
+            raise SystemExit(f"Sybil ağırlık dosyası bulunamadı: {deger} ('varsayilan' ya da 'yok' da yazılabilir)")
+        return Path(deger)
+    yol = Path.home() / ".sybil" / SYBIL_1
+    if not yol.exists():
+        import io
+        import urllib.request
+        import zipfile
+        print(f"Sybil ağırlıkları yok; indiriliyor: {SYBIL_ADRES} -> {yol.parent}", flush=True)
+        yol.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(SYBIL_ADRES) as yanit:
+            zipfile.ZipFile(io.BytesIO(yanit.read())).extractall(yol.parent)
+        if not yol.exists():
+            raise SystemExit(f"İndirilen arşivde {SYBIL_1} yok; --sybil-agirlik ile dosya yolu verin ya da 'yok' yazın.")
+    return yol
+
+
+def sybil_agirlik_yukle(model, yol):
+    """Orijinal Sybil'in havuzlama ve risk katmanı ağırlıklarını başlangıç değeri olarak yükler (adaptör sıfırdan kalır).
+    Bütün parametreler adı ve boyutuyla eşleşmezse durur; eşleşen sayısını döndürür."""
+    kayit = torch.load(yol, map_location="cpu", weights_only=False)
+    sybil = {k[len("model."):]: v for k, v in kayit["state_dict"].items() if k.startswith("model.")}
+    bizim = model.state_dict()
+    istenen = [k for k in bizim if k.startswith(SYBIL_KATMANLAR)]
+    uyan = {k: sybil[k] for k in istenen if k in sybil and sybil[k].shape == bizim[k].shape}
+    if len(uyan) != len(istenen):
+        raise SystemExit(f"Sybil ağırlıkları uymadı ({len(uyan)}/{len(istenen)}): {sorted(set(istenen) - set(uyan))[:5]}")
+    model.load_state_dict(uyan, strict=False)
+    return len(uyan)
+
+
 def model_kur(omurga, dropout=0.25):
     """Primus yüklenmez (primus_weights=None): model kayıtlı Primus çıktılarıyla çalışır."""
     return SybilNet(Namespace(backbone=omurga, primus_weights=None, dropout=dropout, max_followup=MAX_FOLLOWUP))

@@ -56,7 +56,10 @@ uv run python sybil_primus/scripts/0_seri_tara.py --dicom-kok <NLST_klasoru>
 ```
 uv run python sybil_primus/scripts/1_liste_olustur.py --seri-listeleri sonuclar/sybil_primus/tum_seriler.csv --klinik nlst_prsn.csv
 ```
-Sybil'in kendi bölünmesi kullanılacaksa listeye `split` sütunu (train/dev/test) eklenir.
+Her taramadan tek seri seçilir (≤ 2,5 mm, ≥ 50 kesit; nodül kutusu çizilmiş seri öncelikli, sonra en ince).
+Hastalar rastgele %70 / %15 / %15 train / dev / test bölünür (aynı kişinin serileri aynı grupta).
+Not: Bu bölünme orijinal Sybil'in test grubuyla aynı değildir. NV-Reason-CT ile COLIPRI karşılaştırması için
+sorun yoktur; orijinal Sybil'le karşılaştırmada ise test hastalarının bir kısmını Sybil eğitimde görmüş olur.
 
 **2. Primus çıktıları** (her model için)
 ```
@@ -82,6 +85,10 @@ uv run python sybil_primus/scripts/3_egit.py --omurga colipri
 Dikkat kaybının faydasını görmek için her model hem `--dikkat-kaybi` ile hem onsuz eğitilip (`--cikti` ile ayrı
 klasörlere) 4. adımda karşılaştırılabilir.
 
+Havuzlama ve risk katmanları **orijinal Sybil'in eğitilmiş ağırlıklarıyla başlar** (adaptör sıfırdan); ekranda
+"16 parametre eşleşti" yazar. Dosya `~/.sybil/` altında yoksa Sybil'in kendi adresinden bir kez indirilir (~750 MB).
+Sıfırdan başlatmak için `--sybil-agirlik yok`.
+
 **4. Değerlendirme**
 ```
 uv run python sybil_primus/scripts/4_degerlendir.py --modeller sonuclar/sybil_primus/egitim/nv/en_iyi.pt sonuclar/sybil_primus/egitim/colipri/en_iyi.pt
@@ -97,7 +104,8 @@ Kontrol için `--bolum train` ve `son.pt` ile eğitim grubunda da ölçülebilir
 - **Eğitim ayarları** orijinal Sybil'in tarifinden uyarlandı: Adam, lr 1e-4, ağırlık azaltma 1e-2, iyileşme durunca lr
   ×0,1, erken durdurma, en fazla 50 epoch. Küçük veride (yüzlerce seri): `--epoch 100 --sabir 100 --lr-sabir 100 --batch 2`.
 - **Doğrulandı** (task1 sunucusu): kurulum testi, 10 seriyle ezberleme testi ve task1 verisiyle (71 seri) uçtan uca
-  çalıştırma. Model eğitim verisini öğreniyor ama 58 kişiyle genellemiyor; sonuçlar `../sonuclar/`.
+  çalıştırma (o sırada katmanlar sıfırdan başlıyordu). Model eğitim verisini öğreniyor ama 58 kişiyle genellemiyor.
+  Nodül kutularının hizası gerçek bir seride iki model için kontrol edildi.
 
 ## Henüz yapılmayanlar
 

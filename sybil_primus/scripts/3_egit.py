@@ -4,6 +4,8 @@ ADIM 3 — Eğitim: adaptör (864->512) + Sybil havuzlama ve risk katmanları, k
   - Eğitim bölümü (split=train) ile eğitir, her epoch sonunda doğrulama bölümünde (split=dev) ölçer:
       kayıp, C-index ve 1–6. yıl AUC (Sybil'in kendi metrik kodu, sybil/utils/metrics.py).
   - En iyi doğrulama C-index'li epoch'u en_iyi.pt olarak saklar (C-index hesaplanamıyorsa doğrulama kaybı).
+  - Havuzlama ve risk katmanları orijinal Sybil'in eğitilmiş ağırlıklarıyla başlar (--sybil-agirlik; 'yok' ile
+    sıfırdan). Adaptör her zaman sıfırdan başlar. Hepsi yeniden eğitilir.
   - Orijinal Sybil'in eğitim tarifine göre: Adam + ağırlık azaltma 1e-2; doğrulama --lr-sabir epoch iyileşmezse
     lr 10'a bölünür. Erken durdurma: --sabir epoch boyunca iyileşme yoksa durur. Test bölümüne bu adımda bakılmaz.
   - Kayıp: Sybil'in sağkalım kaybı (get_survival_loss). --dikkat-kaybi ile Sybil'in nodül dikkat kaybı
@@ -31,7 +33,8 @@ import torch
 
 from argparse import Namespace
 
-from ortak import MAX_FOLLOWUP, OzellikVeri, metrikler, model_kur, sansur_dagilimi, tahmin_et
+from ortak import (MAX_FOLLOWUP, OzellikVeri, metrikler, model_kur, sansur_dagilimi, sybil_agirlik_yolu,
+                   sybil_agirlik_yukle, tahmin_et)
 from sybil.utils.losses import get_annotation_loss, get_survival_loss
 
 
@@ -85,6 +88,9 @@ def main():
                     help="Sybil'in nodül dikkat kaybını ekle (2b_kutu_cikar.py'nin kutuları gerekir)")
     ap.add_argument("--kutular", default=None, help="varsayılan sonuclar/sybil_primus/kutular/<omurga>")
     ap.add_argument("--dikkat-agirligi", type=float, default=1.0, help="dikkat kaybının ağırlığı (Sybil: 1)")
+    ap.add_argument("--sybil-agirlik", default="varsayilan",
+                    help="havuzlama ve risk katmanlarının başlangıcı: 'varsayilan' = orijinal Sybil'in ağırlıkları "
+                         "(~/.sybil, yoksa indirilir), 'yok' = sıfırdan, ya da bir .ckpt dosyası")
     args = ap.parse_args()
 
     torch.manual_seed(args.tohum)
@@ -118,7 +124,14 @@ def main():
                                              generator=torch.Generator().manual_seed(args.tohum), **ortak)
     dogrulama_yuk = torch.utils.data.DataLoader(dogrulama, batch_size=args.batch, **ortak)
 
-    model = model_kur(mimari, args.dropout).to(cihaz)
+    model = model_kur(mimari, args.dropout)
+    sybil_yolu = sybil_agirlik_yolu(args.sybil_agirlik)
+    if sybil_yolu:
+        print(f"Başlangıç: orijinal Sybil ağırlıkları ({sybil_yolu.name}), "
+              f"{sybil_agirlik_yukle(model, sybil_yolu)} parametre eşleşti (havuzlama + risk); adaptör sıfırdan")
+    else:
+        print("Başlangıç: bütün katmanlar sıfırdan (--sybil-agirlik yok)")
+    model = model.to(cihaz)
     parametreler = [p for p in model.parameters() if p.requires_grad]
     print(f"eğitilen parametre: {sum(p.numel() for p in parametreler) / 1e6:.2f}M")
     optim = torch.optim.Adam(parametreler, lr=args.lr, weight_decay=args.agirlik_azaltma)
@@ -140,7 +153,7 @@ def main():
             if args.dikkat_kaybi:
                 dikkat, _, _ = get_annotation_loss(cikis, batch, model, dikkat_ayar)
                 kayip = kayip + dikkat
-                toplam_dikkat += float(dikkat) * len(batch["x"])
+                toplam_dikkat += float(dikkat.detach()) * len(batch["x"])
             optim.zero_grad()
             kayip.backward()
             optim.step()

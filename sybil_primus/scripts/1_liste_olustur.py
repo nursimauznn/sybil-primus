@@ -16,11 +16,12 @@ NE YAPAR
      NLST'de aynı tarama birkaç seri olarak kayıtlıdır (farklı filtre / kalınlık, yön bulma görüntüleri).
      - kesit sayısı --en-az-kesit'ten az olanlar (yön bulma / localizer) ve kalınlığı --en-fazla-kalinlik'tan
        büyük olanlar elenir,
-     - her taramadan (kişi + tarama yılı) en ince kesitli TEK seri kalır (eşitlikte kesit sayısı çok olan).
+     - her taramadan (kişi + tarama yılı) TEK seri kalır: önce radyoloğun nodül kutusu çizdiği seri (--kutular;
+       varsayılan depodaki veri/nlst_annotations.json), sonra en ince kesitli, eşitlikte kesit sayısı çok olan.
      --tum-seriler ile bu adım atlanır.
   2. Her seri için Sybil'in etiket kuralıyla (orijinal Sybil'deki sybil/datasets/nlst.py get_label) y, y_seq, y_mask,
      time_at_event. Etiketi hesaplanamayan seriler (eksik gün bilgisi, tanı taramadan önce) çıkarılır.
-  3. split sütunu yoksa hastaları eğitim / doğrulama / test diye böler (varsayılan %70 / %15 / %15).
+  3. split sütunu yoksa hastaları eğitim / doğrulama / test diye rastgele böler (--oranlar, varsayılan %70 / %15 / %15).
      Aynı kişinin bütün serileri aynı bölümde kalır; kanserli ve kansersiz kişiler her bölüme orantılı dağıtılır.
 
 ÇIKTI
@@ -30,6 +31,7 @@ NE YAPAR
     uv run python sybil_primus/scripts/1_liste_olustur.py --seri-listeleri veri/vaka_listesi_idc.csv veri/kontrol_listesi.csv --klinik veri/klinik/nlst_prsn.csv
 """
 import argparse
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -37,7 +39,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ortak import sybil_etiketi
+from ortak import KOK, sybil_etiketi
 
 GEREKLI = ["patient_id", "SeriesInstanceUID", "screen_timepoint", "dicom_dir"]
 ISTEGE_BAGLI = ["split", "slice_thickness", "instanceCount"]
@@ -74,8 +76,9 @@ def dicom_bilgisi(klasor):
     return kalinlik, len(dosyalar)
 
 
-def seri_sec(seriler, en_fazla_kalinlik, en_az_kesit, isci):
-    """Orijinal Sybil'deki ince kesit seçimi: her taramadan en ince kesitli tek seri."""
+def seri_sec(seriler, en_fazla_kalinlik, en_az_kesit, isci, kutulu_seriler=frozenset()):
+    """Orijinal Sybil'deki ince kesit seçimi: her taramadan tek seri. Uygun seriler arasında önce nodül kutusu
+    çizilmiş olan, sonra en ince kesitli olan seçilir (kutular aynı taramanın başka bir serisinde kaybolmasın)."""
     eksik_kalinlik = "slice_thickness" not in seriler.columns
     eksik_sayi = "instanceCount" not in seriler.columns
     if eksik_kalinlik or eksik_sayi:
@@ -96,10 +99,16 @@ def seri_sec(seriler, en_fazla_kalinlik, en_az_kesit, isci):
     print(f"Elenen: {int((sayi < en_az_kesit).sum())} seri {en_az_kesit}'den az kesitli (yön bulma vb.), "
           f"{int((kalinlik > en_fazla_kalinlik).sum())} seri {en_fazla_kalinlik} mm'den kalın")
 
-    secim = (seriler[uygun].assign(_k=kalinlik[uygun], _s=-sayi[uygun])
-             .sort_values(["patient_id", "tarama", "_k", "_s", "SeriesInstanceUID"])
-             .drop_duplicates(["patient_id", "tarama"]).drop(columns=["_k", "_s"]))
+    kutulu = seriler["SeriesInstanceUID"].isin(kutulu_seriler)
+    secim = (seriler[uygun].assign(_kutusuz=~kutulu[uygun], _k=kalinlik[uygun], _s=-sayi[uygun])
+             .sort_values(["patient_id", "tarama", "_kutusuz", "_k", "_s", "SeriesInstanceUID"])
+             .drop_duplicates(["patient_id", "tarama"]).drop(columns=["_kutusuz", "_k", "_s"]))
     print(f"Seri seçimi: {len(seriler)} seriden {len(secim)} tarama (her taramadan bir seri)")
+    if kutulu_seriler:
+        secilen = int(secim["SeriesInstanceUID"].isin(kutulu_seriler).sum())
+        print(f"  nodül kutulu seri: listede {int(kutulu.sum())}, seçilen {secilen}"
+              + (f" ({int(kutulu.sum()) - secilen} tanesi kalınlık / kesit sayısı kuralına uymadığı için elendi)"
+                 if secilen < int(kutulu.sum()) else ""))
     return secim.reset_index(drop=True)
 
 
@@ -128,6 +137,8 @@ def main():
     ap.add_argument("--en-az-kesit", type=int, default=50, help="bundan az kesitli seriler (yön bulma) elenir")
     ap.add_argument("--tum-seriler", action="store_true", help="seri seçimini atla, listedeki bütün serileri kullan")
     ap.add_argument("--isci", type=int, default=16, help="DICOM başlığı okumak için paralel iş parçacığı")
+    ap.add_argument("--kutular", default=str(KOK / "veri" / "nlst_annotations.json"),
+                    help="seri seçiminde nodül kutulu seriyi tercih etmek için; 'yok' ile kapatılır")
     args = ap.parse_args()
 
     seriler = oku(args.seri_listeleri)
@@ -135,7 +146,10 @@ def main():
         raise SystemExit(f"split sütunu {int(seriler['split'].isna().sum())} satırda boş. "
                          "Bütün satırları doldurun ya da sütunu kaldırın (o zaman script kendisi böler).")
     if not args.tum_seriler:
-        seriler = seri_sec(seriler, args.en_fazla_kalinlik, args.en_az_kesit, args.isci)
+        kutulu = set()
+        if args.kutular != "yok" and Path(args.kutular).is_file():
+            kutulu = {s for s, k in json.loads(Path(args.kutular).read_text()).items() if any(k.values())}
+        seriler = seri_sec(seriler, args.en_fazla_kalinlik, args.en_az_kesit, args.isci, kutulu)
 
     prsn = pd.read_csv(args.klinik, low_memory=False)
     prsn["hasta"] = prsn["pid" if "pid" in prsn.columns else "dicom_patient_id"].astype(str)
